@@ -1,0 +1,8 @@
+{
+  "release_channel_id": 0,
+  "authorized_role_ids": [],
+  "embed_color": "#202225",
+  "embed_footer": "RCPD Internal Affairs \u2022 Official Release",
+  "max_release_length": 4000,
+  "allow_custom_reasons_and_punishments": true
+}

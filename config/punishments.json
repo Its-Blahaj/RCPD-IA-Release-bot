@@ -1,0 +1,18 @@
+{
+  "warning": {
+    "name": "Official Warning",
+    "requires_duration": false
+  },
+  "suspension": {
+    "name": "Suspension",
+    "requires_duration": true
+  },
+  "termination": {
+    "name": "Termination",
+    "requires_duration": false
+  },
+  "blacklist": {
+    "name": "Departmental Blacklist",
+    "requires_duration": false
+  }
+}

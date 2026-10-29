@@ -1,0 +1,14 @@
+{
+  "failure_to_follow_procedures": {
+    "name": "Failure to Follow Departmental Procedures"
+  },
+  "abuse_of_authority": {
+    "name": "Abuse of Authority"
+  },
+  "corruption": {
+    "name": "Corruption"
+  },
+  "insubordination": {
+    "name": "Insubordination"
+  }
+}
