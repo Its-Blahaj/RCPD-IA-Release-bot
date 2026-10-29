@@ -1,4 +1,4 @@
-# RCPD Internal Affairs Bot
+# RCPD Internal Affairs Bot [W.I.P.]
 
 A configurable Discord bot for publishing two official RCPD Internal Affairs release types:
 - **Disciplinary Release** — rank, officer, multiple violations, multiple punishments, and appeal information.
@@ -88,4 +88,4 @@ Use `\n` in JSON strings for line breaks. Keep the supplied IA seal emoji markup
 
 ## Current scope
 
-This initial version supports the two requested release types and text entry for multiple violations/punishments. The JSON files are included as the central place to maintain the approved list. Optional future enhancements include dropdown-based multi-selects populated directly from those JSON files, case logging, duration fields, and audit history.
+This initial version supports the two requested release types and text entry for multiple violations/punishments. The JSON files are included as the central place to maintain the approved list. Optional future enhancements include dropdown-based multi-selects populated directly from those JSON files, case logging, duration fields, and audit history. I don't know, if it works, havent tested it yet.
