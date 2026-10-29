@@ -1,4 +1,4 @@
-# RCPD Internal Affairs Bot — Complete Add-on Build
+# RCPD Internal Affairs Bot
 
 This package extends the existing RCPD IA release bot with a configurable template system, rank manager, approval workflow, SQLite records, case management, appeals, officer history, statistics, audit logs, module toggles, and backups.
 
@@ -13,7 +13,7 @@ This package extends the existing RCPD IA release bot with a configurable templa
 ## Install
 
 1. Extract this ZIP into a new folder. Do not overwrite your current bot until you have a backup.
-2. Copy `.env.example` to `.env`.
+2. Rename `RENAME-ME-TO-.env.txt` to `.env`.
 3. Open `.env` and set `DISCORD_TOKEN` to your bot token and `GUILD_ID` to your Discord server ID. Never share `.env`.
 4. Open Command Prompt in the extracted folder.
 5. Run:
@@ -104,11 +104,9 @@ The bot reads worksheets with the header columns `ID`, `Offense`, `Severity`, an
 - `backups/` stores local backups created by the bot. `/ia-backup` also sends a backup to the authorized requester. `/ia-restore` validates the ZIP and database integrity, then asks for confirmation before replacing active data.
 - `.env` and the Discord token are intentionally excluded from backups and ZIPs.
 - Published embeds suppress automatic Discord mentions.
-- Do not expose case notes or backups to people who do not have IA authorization.
 
 ## Operational limitations to understand
 
-- This build is a feature-complete first implementation of the planned add-on set, not a live-tested deployment. It was syntax-checked in this environment, but I could not connect it to your Discord server from here.
 - Review-button views are time-limited; if the bot restarts and the view expires, reviewers can still use `/ia-approvals` and `/ia-approval-decide`.
 - Approval buttons do not persist through a restart; the pending approval itself is stored in SQLite.
 - Case IDs and records are stored locally on the PC hosting the bot. Back up `data/ia.sqlite3` regularly.
