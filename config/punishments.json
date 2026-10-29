@@ -1,0 +1,11 @@
+{
+  "verbwarning": {"name": "Verbal Warning", "requires_duration": false},
+  "writwarning": {"name": "Written Warning", "requires_duration": false},
+  "suspension": {"name": "Suspension", "requires_duration": true},
+  "termination": {"name": "Termination", "requires_duration": false},
+  "demotion": {"name": "Demotion", "requires_duration": false},
+  "strike": {"name": "Strike", "requires_duration": false},
+  "ticketblacklist": {"name": "Ticket Blacklist", "requires_duration": false},
+  "permblacklist": {"name": "Permanent Blacklist", "requires_duration": false},
+  "tempblacklist": {"name": "Temporary / Appealable Blacklist", "requires_duration": false}
+}
