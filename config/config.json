@@ -1,0 +1,23 @@
+{
+  "release_channel_id": 1519373114499272794,
+  "authorized_role_ids": [
+    1519356437489254672
+  ],
+  "embed_color": "#202225",
+  "embed_footer": "RCPD Internal Affairs • Official Release",
+  "max_release_length": 4000,
+  "allow_custom_reasons_and_punishments": true,
+  "config_admin_role_ids": [],
+  "approval_role_ids": [
+    1519356437489254672
+  ],
+  "approval_channel_id": 1565781960306069565,
+  "validate_rank_role": false,
+  "investigator_settings": {
+    "ia_role_ids": [
+      1519356437489254672
+    ],
+    "profile_moderator_role_ids": [],
+    "rank_role_mapping": {}
+  }
+}
