@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, time, timedelta, timezone
 
 import discord
@@ -27,18 +28,46 @@ def parse_period(start_date: str | None, end_date: str | None) -> tuple[str, str
     return start.isoformat(), end.isoformat(), start_dt.isoformat(timespec="seconds"), end_dt.isoformat(timespec="seconds")
 
 
-def classify_actions(payload: dict) -> list[str]:
-    raw = str(payload.get("punishments", "") or "").casefold()
-    actions = []
-    if "warning" in raw:
-        actions.append("Official Warning")
-    if "suspension" in raw or "suspended" in raw:
-        actions.append("Suspension")
-    if "termination" in raw or "terminated" in raw:
-        actions.append("Termination")
-    if "blacklist" in raw:
-        actions.append("Departmental Blacklist")
-    return actions or ["Other / Custom Action"]
+def configured_punishment_counts(release_rows) -> tuple[dict[str, int], int]:
+    """Count configured punishment labels from config/punishments.json."""
+    try:
+        configured = core.load_options("punishments.json")
+    except (OSError, ValueError, json.JSONDecodeError):
+        configured = {}
+    labels = {
+        str(key): str(item.get("name", key))
+        for key, item in configured.items()
+        if isinstance(item, dict)
+    }
+    counts = {label: 0 for label in labels.values()}
+    custom_count = 0
+    disciplinary_releases = 0
+
+    for row in release_rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        raw = str(payload.get("punishments", "") or "").strip()
+        if raw.casefold() in {"", "not specified", "none", "n/a", "-"}:
+            continue
+        disciplinary_releases += 1
+        entries = [part.strip() for part in re.split(r"[,;\n]+|\band\b", raw, flags=re.IGNORECASE) if part.strip()]
+        if not entries:
+            entries = [raw]
+        for entry in entries:
+            folded = entry.casefold()
+            matches = [label for key, label in labels.items() if key.casefold() in folded or label.casefold() in folded]
+            if matches:
+                # One selected entry represents one punishment; prefer the most specific match.
+                label = max(set(matches), key=len)
+                counts[label] = counts.get(label, 0) + 1
+            else:
+                custom_count += 1
+
+    if custom_count:
+        counts["Custom / Unconfigured"] = custom_count
+    return counts, disciplinary_releases
 
 
 class StatisticsCog(commands.Cog):
@@ -82,24 +111,13 @@ class StatisticsCog(commands.Cog):
                 appeal_where += " AND reviewer_id=?"
                 appeal_params.append(str(investigator.id))
             appeals = conn.execute(f"SELECT COUNT(*) FROM appeals WHERE {appeal_where}", appeal_params).fetchone()[0]
-        counts = {"Official Warning": 0, "Suspension": 0, "Termination": 0, "Departmental Blacklist": 0, "Other / Custom Action": 0}
-        disciplinary_releases = 0
-        for row in releases:
-            try:
-                payload = json.loads(row["payload_json"] or "{}")
-            except json.JSONDecodeError:
-                payload = {}
-            if str(payload.get("punishments", "") or "").strip().casefold() in {"", "not specified", "none", "n/a", "-"}:
-                continue
-            disciplinary_releases += 1
-            for action in classify_actions(payload):
-                counts[action] += 1
+        counts, disciplinary_releases = configured_punishment_counts(releases)
         title = "RCPD IA Statistics"
         if investigator:
             title += f" — {investigator.display_name}"
         embed = discord.Embed(title=title, color=discord.Color.from_str(core.load_config().get("embed_color", "#202225")))
         embed.description = f"**Reporting period:** {start_label} to {end_label} (UTC)\n**Published disciplinary releases:** {disciplinary_releases}\n**Total disciplinary actions:** {sum(counts.values())}"
-        embed.add_field(name="Disciplinary Actions", value="\n".join(f"**{name}:** {count}" for name, count in counts.items()), inline=False)
+        embed.add_field(name="Disciplinary Actions", value=("\n".join(f"**{name}:** {count}" for name, count in counts.items()) or "No punishment types are configured."), inline=False)
         embed.add_field(name="Case Management", value=f"**Cases opened in period:** {cases_total}\n**Closed / resolved in period:** {cases_closed}", inline=True)
         embed.add_field(name="Appeals", value=f"**Appeals reviewed in period:** {appeals}", inline=True)
         footer = core.load_config().get("embed_footer", "RCPD Internal Affairs • Official Release")
