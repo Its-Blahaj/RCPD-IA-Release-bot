@@ -124,8 +124,9 @@ def stats_for(user_id: int) -> dict[str, int]:
             if str(payload.get("punishments", "") or "").strip().casefold() not in {"", "not specified", "none", "n/a", "-"}:
                 releases += 1
         appeals = conn.execute("SELECT COUNT(*) FROM appeals WHERE reviewer_id=?", (uid,)).fetchone()[0]
+        claims = conn.execute("SELECT COUNT(*) FROM investigator_claims WHERE investigator_id=?", (uid,)).fetchone()[0]
         active = conn.execute("SELECT COUNT(*) FROM cases WHERE assigned_to=? AND status NOT IN ('Closed','Dismissed','Resolved')", (uid,)).fetchone()[0]
-    return {"assigned": assigned, "completed": completed, "active": active, "releases": releases, "appeals": appeals}
+    return {"assigned": assigned, "completed": completed, "active": active, "releases": releases, "appeals": appeals, "claims": claims}
 
 
 class InvestigatorCog(commands.Cog):
@@ -267,29 +268,64 @@ class InvestigatorCog(commands.Cog):
             embed.set_footer(text=f"Showing 40 of {len(members)} investigators.")
         await interaction.response.send_message(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
-    @app_commands.command(name="ia-claim", description="Assign yourself as the IA investigator for an officer.")
+    @app_commands.command(name="ia-claim", description="Claim an officer or assign an IA investigator to a case.")
     @app_commands.guild_only()
-    @app_commands.describe(officer="Officer being contacted", case_code="Optional existing IA case code")
-    async def claim(self, interaction: discord.Interaction, officer: discord.Member, case_code: str | None = None) -> None:
-        investigator = interaction.user
-        if not isinstance(investigator, discord.Member) or not is_ia_member(investigator):
-            await interaction.response.send_message("Only configured IA personnel can claim an officer.", ephemeral=True)
+    @app_commands.describe(
+        officer="Officer being contacted",
+        case_code="Existing IA case reference (required when assigning another investigator)",
+        assigned_investigator="Investigator who should handle this officer/case; defaults to yourself",
+    )
+    async def claim(
+        self,
+        interaction: discord.Interaction,
+        officer: discord.Member,
+        case_code: str | None = None,
+        assigned_investigator: discord.Member | None = None,
+    ) -> None:
+        actor = interaction.user
+        if not isinstance(actor, discord.Member) or not is_ia_member(actor):
+            await interaction.response.send_message("Only configured IA personnel can create investigator assignments.", ephemeral=True)
             return
-        ensure_profile(investigator.id)
-        if case_code:
+
+        target = assigned_investigator or actor
+        assigning_other = target.id != actor.id
+        if not is_ia_member(target):
+            await interaction.response.send_message("The selected member does not have a configured IA investigator role.", ephemeral=True)
+            return
+        if assigning_other and not is_profile_moderator(actor):
+            await interaction.response.send_message("Only IA profile moderators or server administrators can assign a case to another investigator.", ephemeral=True)
+            return
+        if assigning_other and not case_code:
+            await interaction.response.send_message("A case reference is required when assigning another investigator. Use `case_code`.", ephemeral=True)
+            return
+
+        normalized_case = case_code.strip().upper() if case_code else None
+        case_row = None
+        if normalized_case:
             with core.db_connect() as conn:
-                case = conn.execute("SELECT id FROM cases WHERE case_code=?", (case_code.upper(),)).fetchone()
-                if not case:
-                    await interaction.response.send_message("That IA case code was not found.", ephemeral=True)
-                    return
-                conn.execute("UPDATE cases SET assigned_to=?,updated_at=? WHERE id=?", (str(investigator.id), core.utc_now(), case["id"]))
+                case_row = conn.execute("SELECT id FROM cases WHERE case_code=?", (normalized_case,)).fetchone()
+            if not case_row:
+                await interaction.response.send_message(f"IA case `{discord.utils.escape_markdown(normalized_case)}` was not found.", ephemeral=True)
+                return
+
+        ensure_profile(target.id)
+        now = core.utc_now()
         with core.db_connect() as conn:
-            conn.execute("INSERT INTO investigator_claims(investigator_id,officer_id,case_code,created_at) VALUES(?,?,?,?)",
-                         (str(investigator.id), str(officer.id), case_code.upper() if case_code else None, core.utc_now()))
-        core.audit(investigator.id, "investigator.officer_claimed", "investigator_claim", officer.id,
-                   {"case_code": case_code.upper() if case_code else None})
+            if case_row:
+                conn.execute("UPDATE cases SET assigned_to=?,updated_at=? WHERE id=?", (str(target.id), now, case_row["id"]))
+            conn.execute(
+                "INSERT INTO investigator_claims(investigator_id,officer_id,case_code,created_at) VALUES(?,?,?,?)",
+                (str(target.id), str(officer.id), normalized_case, now),
+            )
+        core.audit(actor.id, "investigator.assignment_created", "investigator_claim", officer.id, {
+            "case_code": normalized_case,
+            "assigned_investigator_id": target.id,
+            "assigned_by_id": actor.id,
+            "reassigned": assigning_other,
+        })
+
         with core.db_connect() as conn:
-            row = conn.execute("SELECT timezone FROM investigator_profiles WHERE user_id=?", (str(investigator.id),)).fetchone()
+            row = conn.execute("SELECT timezone FROM investigator_profiles WHERE user_id=?", (str(target.id),)).fetchone()
         zone_name = row["timezone"] if row else "UTC"
         try:
             local = datetime.now(ZoneInfo(zone_name))
@@ -297,19 +333,21 @@ class InvestigatorCog(commands.Cog):
             zone_name, local = "UTC", datetime.now(timezone.utc)
         unix_time = int(local.timestamp())
         investigator_clock = local.strftime("%Y-%m-%d %H:%M %Z")
+        config = core.load_config()
         embed = discord.Embed(
-            title="RCPD Internal Affairs — Investigator Assignment",
-            description=(f"Good day, {officer.mention}. An Internal Affairs Investigator has been assigned to you.\n\n"
-                         "Please keep the investigator's local working hours in mind when arranging communication."),
-            color=discord.Color.from_str(core.load_config().get("embed_color", "#202225")),
+            title="RCPD INTERNAL AFFAIRS  •  INVESTIGATOR ASSIGNMENT",
+            description=(f"An Internal Affairs investigator has been assigned to {officer.mention}.\n"
+                         "Please consider the investigator's local working hours when arranging contact."),
+            color=discord.Color.from_str(config.get("embed_color", "#202225")),
         )
-        embed.add_field(name="Assigned Investigator", value=investigator.mention, inline=True)
-        if case_code:
-            embed.add_field(name="Case Reference", value=f"`{discord.utils.escape_markdown(case_code.upper())}`", inline=True)
-        embed.add_field(name="Investigator's Timezone", value=f"`{zone_name}`", inline=True)
-        embed.add_field(name="Investigator's Current Local Time", value=f"`{investigator_clock}`", inline=True)
-        embed.add_field(name="Your Local Equivalent", value=f"<t:{unix_time}:F> (<t:{unix_time}:R>)", inline=True)
-        embed.set_footer(text=core.load_config().get("embed_footer", "RCPD Internal Affairs • Official Assignment"))
+        embed.add_field(name="ASSIGNED INVESTIGATOR", value=target.mention, inline=True)
+        embed.add_field(name="ASSIGNED BY", value=actor.mention, inline=True)
+        if normalized_case:
+            embed.add_field(name="CASE REFERENCE", value=f"`{discord.utils.escape_markdown(normalized_case)}`", inline=True)
+        embed.add_field(name="INVESTIGATOR TIMEZONE", value=f"`{zone_name}`", inline=True)
+        embed.add_field(name="INVESTIGATOR LOCAL TIME", value=f"`{investigator_clock}`", inline=True)
+        embed.add_field(name="LOCAL TIME FOR OFFICER", value=f"<t:{unix_time}:F> (<t:{unix_time}:R>)", inline=True)
+        embed.set_footer(text=config.get("embed_footer", "RCPD Internal Affairs • Official Assignment"))
         await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
 
     @app_commands.command(name="ia-investigator-sync", description="Initialize profiles for current IA role holders; dates are marked estimated.")
