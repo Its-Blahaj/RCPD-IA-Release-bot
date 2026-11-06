@@ -1,0 +1,22 @@
+{
+  "rotation_interval_seconds": 20,
+  "statuses": [
+    {
+      "type": "watching",
+      "status": "online",
+      "text": "{member_count} members | {guild_count} servers"
+    },
+    {
+      "type": "watching",
+      "status": "dnd",
+      "text": "BIG BROTHER IS WATCHING YOU!"
+    },
+    {
+      "type": "listening",
+      "status": "online",
+      "text": "{published_release_count} IA releases | {investigator_count} investigators"
+    }
+  ],
+  "maintenance_mode": false,
+  "maintenance_text": "UPDATING THE BOT"
+}
