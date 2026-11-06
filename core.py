@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -62,10 +63,33 @@ def safe_text(value: str, max_length: int = 1000) -> str:
     return value
 
 
+_EXPLICIT_USER_MENTION_RE = re.compile(r"<@\[?(\d{15,22})\]?>")
+
+
+def explicit_user_mention_ids(value: str | None) -> list[int]:
+    """Return only user IDs explicitly written as <@123> or <@[123]> by an admin."""
+    if not value:
+        return []
+    return list(dict.fromkeys(int(match.group(1)) for match in _EXPLICIT_USER_MENTION_RE.finditer(value)))
+
+
 def display_officer(user: discord.User | discord.Member | None, manual_name: str | None) -> str:
-    # A manually entered name always wins, even if a Discord user is also selected.
+    # Manual names stay safe by default. Explicit user mention syntax is the opt-in:
+    # both Discord's <@123> and the requested <@[123]> form are accepted.
     if manual_name and manual_name.strip():
-        return discord.utils.escape_mentions(manual_name.strip())
+        raw = manual_name.strip()
+        protected: dict[str, str] = {}
+
+        def preserve_mention(match: re.Match[str]) -> str:
+            token = f"RCPDMENTION{len(protected)}TOKEN"
+            protected[token] = f"<@{match.group(1)}>"
+            return token
+
+        safe = _EXPLICIT_USER_MENTION_RE.sub(preserve_mention, raw)
+        safe = discord.utils.escape_mentions(safe)
+        for token, mention in protected.items():
+            safe = safe.replace(token, mention)
+        return safe
     if user is not None:
         return user.mention
     raise ValueError("Select a Discord user or enter an officer name.")
@@ -301,9 +325,15 @@ class PublishView(discord.ui.View):
             )
             return
         try:
+            officer_mention_ids = explicit_user_mention_ids(str(self.values.get("officer", "")))
+            ping_content = " ".join(f"<@{user_id}>" for user_id in officer_mention_ids) or None
             message = await channel.send(
+                content=ping_content,
                 embed=discord.Embed.from_dict(self.embed_data),
-                allowed_mentions=discord.AllowedMentions.none(),
+                allowed_mentions=discord.AllowedMentions(
+                    users=[discord.Object(id=user_id) for user_id in officer_mention_ids],
+                    roles=False, everyone=False, replied_user=False,
+                ),
             )
             # Store direct publications too, so the dashboard counts both direct and approved releases.
             with db_connect() as conn:
@@ -762,37 +792,48 @@ class ConfigPanelView(discord.ui.View):
             return False
         return True
 
-    def summary(self) -> str:
+    def summary(self) -> discord.Embed:
         config = load_config()
         templates = load_templates()
         channel_id = config.get("release_channel_id")
-        channel_text = f"<#{channel_id}>" if channel_id else "Not configured"
-        authorized_roles = config.get("authorized_role_ids", [])
-        config_roles = config.get("config_admin_role_ids", [])
-        return (
-            "**RCPD Internal Affairs — Configuration Panel**\n"
-            f"**Release channel:** {channel_text}\n"
-            f"**IA release roles:** {len(authorized_roles)} configured\n"
-            f"**Config/moderator roles:** {len(config_roles)} configured\n"
-            f"**Templates:** {', '.join(str(v.get('name', k)) for k, v in templates.items())}\n\n"
-            "Choose a setting below. Changes are saved to the `config` folder immediately."
+        approval_channel_id = config.get("approval_channel_id")
+        embed = discord.Embed(
+            title="RCPD  /  INTERNAL AFFAIRS  /  CONFIGURATION",
+            description=("Manage the department's release workflow, permissions, templates, and presentation.\n"
+                         "Changes are saved immediately to the configuration files."),
+            color=discord.Color.from_str(config.get("embed_color", "#6b0202")),
         )
+        embed.add_field(name="CHANNEL ROUTING", value=(
+            f"**Release destination:** {f'<#{channel_id}>' if channel_id else 'Not configured'}\n"
+            f"**Approval destination:** {f'<#{approval_channel_id}>' if approval_channel_id else 'Not configured'}"), inline=False)
+        embed.add_field(name="ACCESS CONTROL", value=(
+            f"**IA release roles:** `{len(config.get('authorized_role_ids', []))}` configured\n"
+            f"**Config moderator roles:** `{len(config.get('config_admin_role_ids', []))}` configured\n"
+            f"**Approval roles:** `{len(config.get('approval_role_ids', []))}` configured"), inline=True)
+        template_lines = [f"• {discord.utils.escape_markdown(str(v.get('name', k)))} — {'Enabled' if v.get('enabled', True) else 'Disabled'}" for k, v in list(templates.items())[:8]]
+        embed.add_field(name="RELEASE TEMPLATES", value=f"**Templates:** `{len(templates)}`\n" + ("\n".join(template_lines) or "No templates configured."), inline=True)
+        embed.add_field(name="GENERAL SETTINGS", value=(
+            f"**Custom punishments:** {'Enabled' if config.get('allow_custom_reasons_and_punishments', True) else 'Disabled'}\n"
+            f"**Rank validation:** {'Enabled' if config.get('validate_rank_role', False) else 'Disabled'}\n"
+            f"**Maximum release length:** `{config.get('max_release_length', 4000)}`"), inline=False)
+        embed.set_footer(text="RCPD INTERNAL AFFAIRS  •  CONFIGURATION CONTROL PANEL")
+        return embed
 
     @discord.ui.button(label="Release channel", style=discord.ButtonStyle.primary, row=0)
     async def channel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="Choose the channel where approved IA releases should be published.", view=ChannelConfigView(self.author_id))
+        await interaction.response.edit_message(content=None, embed=discord.Embed(title="CONFIGURATION  /  CHANNEL ROUTING", description="Select the text channel where approved releases will be published.", color=discord.Color.from_str(load_config().get("embed_color", "#6b0202"))), view=ChannelConfigView(self.author_id))
 
     @discord.ui.button(label="IA release roles", style=discord.ButtonStyle.primary, row=0)
     async def release_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="Select the roles allowed to create and publish IA releases. This replaces the current list.", view=RoleConfigView(self.author_id, "authorized_role_ids", "Save IA roles"))
+        await interaction.response.edit_message(content=None, embed=discord.Embed(title="CONFIGURATION  /  IA ACCESS", description="Select the roles allowed to create IA releases. The selection replaces the current role list.", color=discord.Color.from_str(load_config().get("embed_color", "#6b0202"))), view=RoleConfigView(self.author_id, "authorized_role_ids", "Save IA roles"))
 
     @discord.ui.button(label="Config / moderator roles", style=discord.ButtonStyle.secondary, row=0)
     async def config_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="Select roles allowed to open and use this configuration panel. Server administrators always retain access.", view=RoleConfigView(self.author_id, "config_admin_role_ids", "Save config roles"))
+        await interaction.response.edit_message(content=None, embed=discord.Embed(title="CONFIGURATION  /  MODERATOR ACCESS", description="Select roles allowed to manage this panel. Server administrators always retain access.", color=discord.Color.from_str(load_config().get("embed_color", "#6b0202"))), view=RoleConfigView(self.author_id, "config_admin_role_ids", "Save config roles"))
 
     @discord.ui.button(label="Edit templates / embeds", style=discord.ButtonStyle.success, row=1)
     async def templates_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="Choose which release embed to edit.", view=TemplateChooseView(self.author_id))
+        await interaction.response.edit_message(content=None, embed=discord.Embed(title="CONFIGURATION  /  RELEASE TEMPLATES", description="Choose a template to edit its embed appearance, text, media, and fields.", color=discord.Color.from_str(load_config().get("embed_color", "#6b0202"))), view=TemplateChooseView(self.author_id))
 
     @discord.ui.button(label="Other settings", style=discord.ButtonStyle.secondary, row=1)
     async def other_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -800,7 +841,8 @@ class ConfigPanelView(discord.ui.View):
 
     @discord.ui.button(label="Refresh panel", style=discord.ButtonStyle.secondary, row=1)
     async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content=self.summary(), view=ConfigPanelView(self.author_id))
+        panel = ConfigPanelView(self.author_id)
+        await interaction.response.edit_message(content=None, embed=panel.summary(), view=panel)
 
 
 class ChannelConfigView(discord.ui.View):
@@ -828,7 +870,8 @@ class ReleaseChannelSelect(discord.ui.ChannelSelect):
     async def callback(self, interaction: discord.Interaction) -> None:
         channel = self.values[0]
         write_config_value("release_channel_id", channel.id)
-        await interaction.response.edit_message(content=f"Release channel saved: {channel.mention}", view=ConfigPanelView(interaction.user.id))
+        panel = ConfigPanelView(interaction.user.id)
+        await interaction.response.edit_message(content=None, embed=panel.summary(), view=panel)
 
 
 class RoleConfigView(discord.ui.View):
@@ -857,8 +900,8 @@ class ConfigRoleSelect(discord.ui.RoleSelect):
     async def callback(self, interaction: discord.Interaction) -> None:
         role_ids = [role.id for role in self.values]
         write_config_value(self.config_key, role_ids)
-        label = "IA release roles" if self.config_key == "authorized_role_ids" else "Config/moderator roles"
-        await interaction.response.edit_message(content=f"Saved {len(role_ids)} {label.lower()}.", view=ConfigPanelView(interaction.user.id))
+        panel = ConfigPanelView(interaction.user.id)
+        await interaction.response.edit_message(content=None, embed=panel.summary(), view=panel)
 
 
 class BackToConfigButton(discord.ui.Button):
@@ -870,7 +913,8 @@ class BackToConfigButton(discord.ui.Button):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("Only the person who opened this panel can use it.", ephemeral=True)
             return
-        await interaction.response.edit_message(content=ConfigPanelView(self.author_id).summary(), view=ConfigPanelView(self.author_id))
+        panel = ConfigPanelView(self.author_id)
+        await interaction.response.edit_message(content=None, embed=panel.summary(), view=panel)
 
 
 class TemplateChooseView(discord.ui.View):
@@ -887,14 +931,14 @@ class TemplateChooseView(discord.ui.View):
         if self.page <= 0:
             await interaction.response.send_message("Already on the first template page.", ephemeral=True)
             return
-        await interaction.response.edit_message(content="Choose which release embed to edit.", view=TemplateChooseView(self.author_id, self.page - 1))
+        await interaction.response.edit_message(content=None, embed=discord.Embed(title="CONFIGURATION  /  RELEASE TEMPLATES", description="Choose a template to edit.", color=discord.Color.from_str(load_config().get("embed_color", "#6b0202"))), view=TemplateChooseView(self.author_id, self.page - 1))
 
     @discord.ui.button(label="Next templates", style=discord.ButtonStyle.secondary, row=1)
     async def next_templates(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if (self.page + 1) * 25 >= len(self.templates):
             await interaction.response.send_message("There are no more templates.", ephemeral=True)
             return
-        await interaction.response.edit_message(content="Choose which release embed to edit.", view=TemplateChooseView(self.author_id, self.page + 1))
+        await interaction.response.edit_message(content=None, embed=discord.Embed(title="CONFIGURATION  /  RELEASE TEMPLATES", description="Choose a template to edit.", color=discord.Color.from_str(load_config().get("embed_color", "#6b0202"))), view=TemplateChooseView(self.author_id, self.page + 1))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -913,7 +957,7 @@ class TemplateSelect(discord.ui.Select):
         super().__init__(placeholder=f"Select a release template (page {page + 1})", min_values=1, max_values=1, options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.edit_message(content="Edit the selected embed's basic or advanced properties. Each save is written immediately.", view=TemplateEditorView(interaction.user.id, self.values[0]))
+        await interaction.response.edit_message(content=None, embed=discord.Embed(title="CONFIGURATION  /  TEMPLATE EDITOR", description="Edit the selected template. Each successful save is written immediately.", color=discord.Color.from_str(load_config().get("embed_color", "#6b0202"))), view=TemplateEditorView(interaction.user.id, self.values[0]))
 
 
 class TemplateEditorView(discord.ui.View):
@@ -959,7 +1003,7 @@ class TemplateEditorView(discord.ui.View):
 
     @discord.ui.button(label="Choose another template", style=discord.ButtonStyle.secondary, row=1)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="Choose which release embed to edit.", view=TemplateChooseView(self.author_id))
+        await interaction.response.edit_message(content=None, embed=discord.Embed(title="CONFIGURATION  /  RELEASE TEMPLATES", description="Choose a template to edit its embed appearance, text, media, and fields.", color=discord.Color.from_str(load_config().get("embed_color", "#6b0202"))), view=TemplateChooseView(self.author_id))
 
 
 class TemplateBasicModal(discord.ui.Modal):
@@ -1084,10 +1128,34 @@ class OtherSettingsModal(discord.ui.Modal):
         await interaction.response.send_message("Other settings saved.", ephemeral=True)
 
 
+class MaintenanceCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction, /) -> bool:
+        """During maintenance, only administrators/config moderators may run commands."""
+        try:
+            with (CONFIG_DIR / "status.json").open("r", encoding="utf-8") as handle:
+                status_settings = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            status_settings = {}
+        if not status_settings.get("maintenance_mode", False):
+            return True
+        try:
+            config = load_config()
+        except (OSError, json.JSONDecodeError):
+            config = {}
+        if can_manage_config(interaction, config):
+            return True
+        await interaction.response.send_message(
+            "The bot is currently in maintenance mode. Only server administrators and configured config roles can use commands.",
+            ephemeral=True,
+        )
+        return False
+
+
 class IABot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.load_extension("cogs.investigators")
         await self.load_extension("cogs.statistics")
+        await self.load_extension("cogs.status_manager")
         if GUILD_ID and GUILD_ID.isdigit():
             guild = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
@@ -1100,7 +1168,7 @@ class IABot(commands.Bot):
 
 intents = discord.Intents.default()
 intents.members = True
-bot = IABot(command_prefix="!", intents=intents)
+bot = IABot(command_prefix="!", intents=intents, tree_cls=MaintenanceCommandTree)
 
 
 @bot.event
@@ -1128,11 +1196,12 @@ HELP_PAGES: dict[str, dict[str, Any]] = {
         "description": "Configure bot access, channels, embeds, role mappings, and data files.",
         "commands": [
             ("/ia-config", "Open the interactive configuration panel. Server administrators and configured config moderators can change supported settings."),
+            ("/ia-maintanance", "Enable or disable maintenance mode. While active, only server administrators and configured config roles can use bot commands."),
             ("/ia-reload-config", "Reload and validate config/templates/punishments and the Excel violation matrix. Administrator-only."),
             ("/ia-module-toggle", "Enable or disable one of the optional modules: cases, appeals, or templates."),
             ("/ia-rank-role-check", "Toggle whether selected officers must have the Discord role linked to their rank."),
         ],
-        "config": "`config/config.json` settings:\n• `release_channel_id`: destination channel for published releases.\n• `authorized_role_ids`: roles allowed to use IA release and operational features.\n• `config_admin_role_ids`: roles allowed to manage bot configuration; server administrators also have access.\n• `approval_role_ids`: roles allowed to review release approvals.\n• `approval_channel_id`: channel receiving approval requests.\n• `embed_color` / `embed_footer`: default embed styling.\n• `max_release_length`: maximum rendered release length.\n• `allow_custom_reasons_and_punishments`: allow manually entered reasons/punishments.\n• `validate_rank_role`: require the selected officer's mapped rank role.\n• `investigator_settings.ia_role_ids`: roles counted as IA investigators.\n• `investigator_settings.profile_moderator_role_ids`: roles allowed to moderate investigator profiles.\n• `investigator_settings.rank_role_mapping`: maps rank labels to Discord role IDs.\n`violations.xlsx` supplies offense categories and offense/severity/punishment rows."
+        "config": "`config/config.json` settings:\n• `release_channel_id`: destination channel for published releases.\n• `authorized_role_ids`: roles allowed to use IA release and operational features.\n• `config_admin_role_ids`: roles allowed to manage bot configuration; server administrators also have access.\n• `config/status.json`: rotating bot presence, placeholders, and maintenance-mode settings.\n• `approval_role_ids`: roles allowed to review release approvals.\n• `approval_channel_id`: channel receiving approval requests.\n• `embed_color` / `embed_footer`: default embed styling.\n• `max_release_length`: maximum rendered release length.\n• `allow_custom_reasons_and_punishments`: allow manually entered reasons/punishments.\n• `validate_rank_role`: require the selected officer's mapped rank role.\n• `investigator_settings.ia_role_ids`: roles counted as IA investigators.\n• `investigator_settings.profile_moderator_role_ids`: roles allowed to moderate investigator profiles.\n• `investigator_settings.rank_role_mapping`: maps rank labels to Discord role IDs.\n`violations.xlsx` supplies offense categories and offense/severity/punishment rows."
     },
     "cases": {
         "label": "Cases & Appeals",
@@ -1158,7 +1227,7 @@ HELP_PAGES: dict[str, dict[str, Any]] = {
             ("/ia-special-info", "Set or clear special information displayed on an investigator profile. Moderator permissions apply."),
             ("/ia-investigators", "List current IA investigators."),
             ("/ia-investigator-sync", "Initialize profiles for current IA role holders. Initial join dates are marked estimated because Discord does not provide historical role assignment dates."),
-            ("/ia-claim", "Assign yourself as the IA investigator contacting a specified officer; an existing case reference can optionally be attached."),
+            ("/ia-claim", "Claim an officer for yourself, or (with profile-moderator permissions) assign another IA investigator to an existing case. Provide `case_code` and `assigned_investigator` for a delegated assignment."),
         ],
         "config": "Under `investigator_settings`, `ia_role_ids` defines who counts as an investigator; `profile_moderator_role_ids` grants profile moderation; `rank_role_mapping` links rank names to Discord roles. Profile and role-history data are stored in SQLite."
     },
@@ -1178,81 +1247,120 @@ HELP_PAGES: dict[str, dict[str, Any]] = {
 }
 
 
-def help_embed(category: str) -> discord.Embed:
+def help_embed(category: str, command_index: int = 0, show_config: bool = False) -> discord.Embed:
     page = HELP_PAGES[category]
     config = load_config()
     embed = discord.Embed(
-        title=f"RCPD Internal Affairs Help — {page['label']}",
+        title=f"RCPD  /  INTERNAL AFFAIRS  /  {page['label'].upper()}",
         description=page["description"],
-        color=discord.Color.from_str(config.get("embed_color", "#202225")),
+        color=discord.Color.from_str(config.get("embed_color", "#6b0202")),
     )
-    command_text = "\n\n".join(f"**{name}**\n{description}" for name, description in page["commands"])
-    # Keep each embed field within Discord's 1024-character field limit.
-    chunks: list[str] = []
-    current = ""
-    for block in command_text.split("\n\n"):
-        if current and len(current) + len(block) + 2 > 1000:
-            chunks.append(current)
-            current = block
-        else:
-            current = f"{current}\n\n{block}" if current else block
-    if current:
-        chunks.append(current)
-    for index, chunk in enumerate(chunks, start=1):
-        embed.add_field(name="Commands" if index == 1 else f"Commands (continued {index})", value=chunk, inline=False)
-    config_text = page["config"]
-    if category == "releases":
-        try:
-            templates = load_templates()
-            names = [f"• `{key}` — {value.get('name', key)} ({'enabled' if value.get('enabled', True) else 'disabled'}; {'approval required' if value.get('approval_required') else 'no approval'})" for key, value in templates.items()]
-            config_text += "\n\n**Currently defined templates**\n" + ("\n".join(names) or "No templates found.")
-        except (OSError, ValueError, json.JSONDecodeError):
-            config_text += "\n\nTemplate file could not be read."
-        try:
-            punishments = load_options("punishments.json")
-            config_text += "\n\n**Configured punishments**\n" + "\n".join(f"• {v.get('name', k)} (`{k}`; {'duration required' if v.get('requires_duration') else 'no duration required'})" for k, v in punishments.items())
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
-    if category == "configuration":
-        channel_id = config.get("release_channel_id")
-        approval_channel_id = config.get("approval_channel_id")
-        config_text += (f"\n\n**Current values**\n"
-                        f"• Release channel: {f'<#{channel_id}>' if channel_id else 'not set'}\n"
-                        f"• Approval channel: {f'<#{approval_channel_id}>' if approval_channel_id else 'not set'}\n"
-                        f"• Authorized roles: {len(config.get('authorized_role_ids', []))}\n"
-                        f"• Config moderator roles: {len(config.get('config_admin_role_ids', []))}\n"
-                        f"• Approval roles: {len(config.get('approval_role_ids', []))}\n"
-                        f"• Custom reasons/punishments: {'enabled' if config.get('allow_custom_reasons_and_punishments', True) else 'disabled'}\n"
-                        f"• Rank-role validation: {'enabled' if config.get('validate_rank_role', False) else 'disabled'}")
-    # Split configuration documentation if needed to respect Discord's field limit.
-    for index in range(0, len(config_text), 1000):
-        embed.add_field(name="Config & files" if index == 0 else "Config & files (continued)", value=config_text[index:index + 1000], inline=False)
-    embed.set_footer(text=config.get("embed_footer", "RCPD Internal Affairs"))
+    commands = page["commands"]
+    if show_config:
+        config_text = page["config"]
+        if category == "releases":
+            try:
+                templates = load_templates()
+                rows = [f"`{key}` — **{value.get('name', key)}** · {'Enabled' if value.get('enabled', True) else 'Disabled'} · {'Approval required' if value.get('approval_required') else 'Direct publish'}" for key, value in templates.items()]
+                config_text += "\n\n**Configured release templates**\n" + ("\n".join(rows) or "No templates configured.")
+            except (OSError, ValueError, json.JSONDecodeError):
+                config_text += "\n\nTemplate configuration could not be read."
+            try:
+                punishments = load_options("punishments.json")
+                rows = [f"• **{item.get('name', key)}** · `{key}` · {'Duration required' if item.get('requires_duration') else 'No duration required'}" for key, item in punishments.items()]
+                config_text += "\n\n**Configured punishments**\n" + ("\n".join(rows) or "No punishments configured.")
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+        elif category == "configuration":
+            release_id = config.get("release_channel_id")
+            approval_id = config.get("approval_channel_id")
+            config_text += (
+                "\n\n**LIVE CONFIGURATION**\n"
+                f"• Release channel: {f'<#{release_id}>' if release_id else 'Not configured'}\n"
+                f"• Approval channel: {f'<#{approval_id}>' if approval_id else 'Not configured'}\n"
+                f"• Authorized roles: **{len(config.get('authorized_role_ids', []))}**\n"
+                f"• Config roles: **{len(config.get('config_admin_role_ids', []))}**\n"
+                f"• Approval roles: **{len(config.get('approval_role_ids', []))}**\n"
+                f"• Custom punishments: **{'Enabled' if config.get('allow_custom_reasons_and_punishments', True) else 'Disabled'}**\n"
+                f"• Rank validation: **{'Enabled' if config.get('validate_rank_role', False) else 'Disabled'}**"
+            )
+        config_chunks = [config_text[index:index + 1000] for index in range(0, len(config_text), 1000)] or ["No configuration notes are available."]
+        for index, chunk in enumerate(config_chunks[:20], start=1):
+            embed.add_field(name="CONFIGURATION REFERENCE" if index == 1 else f"CONFIGURATION REFERENCE · {index}", value=chunk or "—", inline=False)
+        embed.set_footer(text=f"RCPD INTERNAL AFFAIRS  •  {page['label']}  •  CONFIGURATION")
+        return embed
+
+    command_index = max(0, min(command_index, len(commands) - 1)) if commands else 0
+    if commands:
+        name, description = commands[command_index]
+        embed.add_field(name="COMMAND", value=f"```{name}```", inline=False)
+        embed.add_field(name="WHAT IT DOES", value=description, inline=False)
+        embed.add_field(name="ACCESS & NOTES", value="Command availability depends on your IA roles, module settings, and the permissions described in the Configuration page.", inline=False)
+        embed.set_footer(text=f"RCPD INTERNAL AFFAIRS  •  {page['label']}  •  COMMAND {command_index + 1}/{len(commands)}")
+    else:
+        embed.add_field(name="COMMANDS", value="No commands are listed for this category yet.", inline=False)
     return embed
 
 
 class HelpCategorySelect(discord.ui.Select):
     def __init__(self):
         options = [discord.SelectOption(label=page["label"], value=key, description=page["description"][:100]) for key, page in HELP_PAGES.items()]
-        super().__init__(placeholder="Choose a help category…", min_values=1, max_values=1, options=options)
+        super().__init__(placeholder="Browse a help category…", min_values=1, max_values=1, options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.edit_message(embed=help_embed(self.values[0]), view=self.view)
+        view: HelpView = self.view  # type: ignore[assignment]
+        view.category = self.values[0]
+        view.command_index = 0
+        view.show_config = False
+        view.refresh_controls()
+        await interaction.response.edit_message(content=None, embed=view.current_embed(), view=view)
 
 
 class HelpView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
+        self.category = "releases"
+        self.command_index = 0
+        self.show_config = False
         self.add_item(HelpCategorySelect())
+        self.refresh_controls()
+
+    def current_embed(self) -> discord.Embed:
+        return help_embed(self.category, self.command_index, self.show_config)
+
+    def refresh_controls(self) -> None:
+        commands = HELP_PAGES[self.category]["commands"]
+        self.previous_button.disabled = self.show_config or self.command_index <= 0
+        self.next_button.disabled = self.show_config or self.command_index >= len(commands) - 1
+        self.config_button.label = "View commands" if self.show_config else "Configuration"
+        self.config_button.style = discord.ButtonStyle.primary if self.show_config else discord.ButtonStyle.secondary
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.command_index = max(0, self.command_index - 1)
+        self.refresh_controls()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary, row=1)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.command_index = min(len(HELP_PAGES[self.category]["commands"]) - 1, self.command_index + 1)
+        self.refresh_controls()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label="Configuration", style=discord.ButtonStyle.secondary, row=1)
+    async def config_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.show_config = not self.show_config
+        self.refresh_controls()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
 
 
-@bot.tree.command(name="help", description="Browse categorized RCPD IA command and configuration help.")
+@bot.tree.command(name="help", description="Browse RCPD IA commands one page at a time.")
 @app_commands.guild_only()
 async def ia_help(interaction: discord.Interaction) -> None:
     view = HelpView()
     await interaction.response.send_message(
-        "Select a category to see its commands, explanations, and related configuration:",
-        embed=help_embed("releases"), view=view, ephemeral=True,
+        "**RCPD INTERNAL AFFAIRS  /  COMMAND DIRECTORY**\nSelect a category, then browse one command per page. Use Configuration for related settings and files.",
+        embed=view.current_embed(), view=view, ephemeral=True,
     )
 
 
@@ -1285,7 +1393,7 @@ async def ia_config(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Only server administrators or configured config/moderator roles can use this panel.", ephemeral=True)
         return
     panel = ConfigPanelView(interaction.user.id)
-    await interaction.response.send_message(panel.summary(), view=panel, ephemeral=True)
+    await interaction.response.send_message(embed=panel.summary(), view=panel, ephemeral=True)
 
 
 @bot.tree.command(name="ia-reload-config", description="Reload IA configuration and validate the Excel matrix.")
@@ -1314,7 +1422,6 @@ async def ia_reload_config(interaction: discord.Interaction) -> None:
 # SQLite-backed template versioning, ranks, approvals, cases, appeals, audit and backups.
 import csv
 import io
-import re
 import shutil
 import sqlite3
 import zipfile
@@ -1598,7 +1705,7 @@ class RankAdminView(discord.ui.View):
     @discord.ui.button(label="Back to Config", style=discord.ButtonStyle.secondary)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         panel = ConfigPanelView(interaction.user.id)
-        await interaction.response.edit_message(content=panel.summary(), view=panel)
+        await interaction.response.edit_message(content=None, embed=panel.summary(), view=panel)
 
 
 class ApprovalRulesModal(discord.ui.Modal, title="Approval rules"):
@@ -2144,7 +2251,17 @@ async def approve_release(interaction: discord.Interaction, release_id: int, not
             await interaction.response.send_message("The release channel is not configured.", ephemeral=True)
             return
         try:
-            message = await channel.send(embed=discord.Embed.from_dict(json.loads(row["embed_json"])), allowed_mentions=discord.AllowedMentions.none())
+            payload = json.loads(row["payload_json"] or "{}")
+            officer_mention_ids = explicit_user_mention_ids(str(payload.get("officer", "")))
+            ping_content = " ".join(f"<@{user_id}>" for user_id in officer_mention_ids) or None
+            message = await channel.send(
+                content=ping_content,
+                embed=discord.Embed.from_dict(json.loads(row["embed_json"])),
+                allowed_mentions=discord.AllowedMentions(
+                    users=[discord.Object(id=user_id) for user_id in officer_mention_ids],
+                    roles=False, everyone=False, replied_user=False,
+                ),
+            )
         except discord.HTTPException:
             await interaction.response.send_message("Discord failed to publish the approved release. Check channel permissions.", ephemeral=True)
             return
@@ -2185,11 +2302,30 @@ def stats_text() -> str:
         cases_open = conn.execute("SELECT COUNT(*) FROM cases WHERE status NOT IN ('Closed','Dismissed')").fetchone()[0]
         pending = conn.execute("SELECT COUNT(*) FROM approvals WHERE status='pending'").fetchone()[0]
         appeals_pending = conn.execute("SELECT COUNT(*) FROM appeals WHERE status='Pending'").fetchone()[0]
-        releases = conn.execute("SELECT COUNT(*) FROM releases WHERE status='published'").fetchone()[0]
+        release_rows = conn.execute("SELECT payload_json FROM releases WHERE status='published'").fetchall()
         ranks = conn.execute("SELECT COUNT(*) FROM ranks WHERE enabled=1").fetchone()[0]
+    try:
+        punishment_config = load_options("punishments.json")
+    except (OSError, ValueError, json.JSONDecodeError):
+        punishment_config = {}
+    punishment_counts = {str(item.get("name", key)): 0 for key, item in punishment_config.items() if isinstance(item, dict)}
+    for row in release_rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        raw = str(payload.get("punishments", "") or "").casefold()
+        for key, item in punishment_config.items():
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("name", key))
+            if key.casefold() in raw or label.casefold() in raw:
+                punishment_counts[label] = punishment_counts.get(label, 0) + 1
+    punishment_lines = "\n".join(f"• {name}: **{count}**" for name, count in punishment_counts.items()) or "No configured punishment types."
     return ("**RCPD IA Statistics**\n"
-            f"Published releases: **{releases}**\nCases: **{cases_total}** total / **{cases_open}** active\n"
-            f"Pending approvals: **{pending}**\nPending appeals: **{appeals_pending}**\nActive ranks: **{ranks}**")
+            f"Published releases: **{len(release_rows)}**\nCases: **{cases_total}** total / **{cases_open}** active\n"
+            f"Pending approvals: **{pending}**\nPending appeals: **{appeals_pending}**\nActive ranks: **{ranks}**\n\n"
+            f"**Disciplinary actions by configured punishment**\n{punishment_lines}")
 
 
 def audit_text(limit: int = 10) -> str:
